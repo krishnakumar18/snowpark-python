@@ -1,4 +1,4 @@
-{% set name = "snowflake-snowpark-python" %}
+{% set name = "snowflake-python" %}
 {% set version = "0.8.0" %}
 
 package:
