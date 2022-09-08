@@ -3,9 +3,12 @@
 # Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
 #
 import re
+import typing
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from snowflake.snowpark._internal.analyzer.binary_plan_node import (
+    Except,
+    Intersect,
     JoinType,
     LeftAnti,
     LeftSemi,
@@ -56,6 +59,7 @@ SELECT = " SELECT "
 FROM = " FROM "
 WHERE = " WHERE "
 LIMIT = " LIMIT "
+OFFSET = " OFFSET "
 PIVOT = " PIVOT "
 UNPIVOT = " UNPIVOT "
 FOR = " FOR "
@@ -129,6 +133,10 @@ MATCHED = " MATCHED "
 LISTAGG = " LISTAGG "
 HEADER = " HEADER "
 IGNORE_NULLS = " IGNORE NULLS "
+UNION = " UNION "
+UNION_ALL = " UNION ALL "
+INTERSECT = f" {Intersect.sql} "
+EXCEPT = f" {Except.sql} "
 
 
 def result_scan_statement(uuid_place_holder: str) -> str:
@@ -698,6 +706,10 @@ def get_options_statement(options: Dict[str, Any]) -> str:
     return (
         SPACE
         + SPACE.join(
+            # TODO: this next line adds single quotes around the option values, this is
+            #  incorrect to do unless we escape single quotes in the middle of the string
+            # TODO: I can't find documentation that string's repr is guaranteed to be
+            #  surrounded by single quotes, if this ever changes we'll be broken
             # repr("a") return "'a'" instead of "a". This is what we need for str values. For bool, int, float, repr(v) and str(v) return the same.
             f"{k}{EQUALS}{v if (isinstance(v, str) and is_single_quoted(v)) else repr(v)}"
             for k, v in options.items()
@@ -859,7 +871,7 @@ def unpivot_statement(
 def copy_into_table(
     table_name: str,
     file_path: str,
-    file_format: str,
+    file_format_type: str,
     format_type_options: Dict[str, Any],
     copy_options: Dict[str, Any],
     pattern: str,
@@ -919,10 +931,7 @@ def copy_into_table(
         if validation_mode
         else EMPTY_STRING
     )
-    ftostr = FILE_FORMAT + EQUALS + LEFT_PARENTHESIS + TYPE + EQUALS + file_format
-    if format_type_options:
-        ftostr += SPACE + get_options_statement(format_type_options) + SPACE
-    ftostr += RIGHT_PARENTHESIS
+    ftostr = get_file_format_spec(file_format_type, format_type_options)
 
     if copy_options:
         costr = SPACE + get_options_statement(copy_options) + SPACE
@@ -1165,12 +1174,14 @@ def single_quote(value: str) -> str:
         return SINGLE_QUOTE + value + SINGLE_QUOTE
 
 
+ALREADY_QUOTED = re.compile('^(".+")$')
+UNQUOTED_CASE_INSENSITIVE = re.compile("^([_A-Za-z]+[_A-Za-z0-9$]*)$")
+
+
 def quote_name(name: str) -> str:
-    already_quoted = re.compile('^(".+")$')
-    unquoted_case_insensitive = re.compile("^([_A-Za-z]+[_A-Za-z0-9$]*)$")
-    if already_quoted.match(name):
+    if ALREADY_QUOTED.match(name):
         return validate_quoted_name(name)
-    elif unquoted_case_insensitive.match(name):
+    elif UNQUOTED_CASE_INSENSITIVE.match(name):
         return DOUBLE_QUOTE + escape_quotes(name.upper()) + DOUBLE_QUOTE
     else:
         return DOUBLE_QUOTE + escape_quotes(name) + DOUBLE_QUOTE
@@ -1203,3 +1214,20 @@ def number(precision: int = 38, scale: int = 0) -> str:
         + str(scale)
         + RIGHT_PARENTHESIS
     )
+
+
+def get_file_format_spec(
+    file_format_type: str, format_type_options: typing.Dict[str, Any]
+) -> str:
+    file_format_name = format_type_options.get("FORMAT_NAME")
+    file_format_str = FILE_FORMAT + EQUALS + LEFT_PARENTHESIS
+    if file_format_name is None:
+        file_format_str += TYPE + EQUALS + file_format_type
+        if format_type_options:
+            file_format_str += (
+                SPACE + get_options_statement(format_type_options) + SPACE
+            )
+    else:
+        file_format_str += FORMAT_NAME + EQUALS + file_format_name
+    file_format_str += RIGHT_PARENTHESIS
+    return file_format_str

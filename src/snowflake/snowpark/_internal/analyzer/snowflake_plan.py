@@ -6,7 +6,10 @@ import re
 import sys
 import uuid
 from functools import cached_property, reduce
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from snowflake.snowpark._internal.analyzer.select_statement import Selectable
 
 import snowflake.connector
 import snowflake.snowpark
@@ -675,42 +678,52 @@ class SnowflakePlanBuilder:
             self.session._conn._telemetry_client.send_copy_pattern_telemetry()
 
         if not copy_options:  # use select
-            temp_file_format_name = (
-                fully_qualified_schema
-                + "."
-                + random_name_for_temp_object(TempObjectType.FILE_FORMAT)
-            )
-            queries = [
-                Query(
-                    create_file_format_statement(
-                        temp_file_format_name,
-                        format,
-                        format_type_options,
-                        temp=True,
-                        if_not_exist=True,
-                    ),
-                    is_ddl_on_temp_object=True,
-                ),
+            queries: List[Query] = []
+            post_queries: List[Query] = []
+            use_temp_file_format: bool = "FORMAT_NAME" not in options
+            if use_temp_file_format:
+                format_name = (
+                    fully_qualified_schema
+                    + "."
+                    + random_name_for_temp_object(TempObjectType.FILE_FORMAT)
+                )
+                queries.append(
+                    Query(
+                        create_file_format_statement(
+                            format_name,
+                            format,
+                            format_type_options,
+                            temp=True,
+                            if_not_exist=True,
+                        ),
+                        is_ddl_on_temp_object=True,
+                    )
+                )
+                post_queries.append(
+                    Query(
+                        drop_file_format_if_exists_statement(format_name),
+                        is_ddl_on_temp_object=True,
+                    )
+                )
+            else:
+                format_name = options["FORMAT_NAME"]
+
+            queries.append(
                 Query(
                     select_from_path_with_format_statement(
                         schema_cast_named(schema_to_cast)
                         if infer_schema
                         else schema_cast_seq(schema),
                         path,
-                        temp_file_format_name,
+                        format_name,
                         pattern,
                     )
-                ),
-            ]
+                )
+            )
             return SnowflakePlan(
                 queries,
                 schema_value_statement(schema),
-                [
-                    Query(
-                        drop_file_format_if_exists_statement(temp_file_format_name),
-                        is_ddl_on_temp_object=True,
-                    )
-                ],
+                post_queries,
                 {},
                 self.session,
                 None,
@@ -812,7 +825,7 @@ class SnowflakePlanBuilder:
             table_name=table_name,
             file_path=path,
             files=files,
-            file_format=file_format,
+            file_format_type=file_format,
             format_type_options=format_type_options,
             copy_options=copy_options,
             pattern=pattern,
@@ -944,6 +957,9 @@ class SnowflakePlanBuilder:
             source_plan,
         )
 
+    def select_statement(self, selectable: "Selectable") -> SnowflakePlan:
+        return selectable.snowflake_plan
+
     def add_result_scan_if_not_select(self, plan: SnowflakePlan) -> SnowflakePlan:
         if isinstance(plan.source_plan, SetOperation):
             return plan
@@ -981,6 +997,9 @@ class Query:
             else f"query_id_place_holder_{generate_random_alphanumeric()}"
         )
         self.is_ddl_on_temp_object = is_ddl_on_temp_object
+
+    def __repr__(self) -> str:
+        return f"Query({self.sql}, {self.query_id_place_holder}, {self.is_ddl_on_temp_object})"
 
 
 class BatchInsertQuery(Query):
