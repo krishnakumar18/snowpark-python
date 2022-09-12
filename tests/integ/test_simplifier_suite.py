@@ -2,6 +2,8 @@
 # Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
 #
 
+from typing import Iterable, Tuple
+
 import pytest
 
 from snowflake.snowpark import Row, context
@@ -13,8 +15,8 @@ from snowflake.snowpark._internal.analyzer.select_statement import (
 )
 from snowflake.snowpark.context import _use_sql_simplifier
 from snowflake.snowpark.exceptions import SnowparkSQLException
-from snowflake.snowpark.functions import col, lit, sql_expr
-from tests.utils import Utils
+from snowflake.snowpark.functions import col, lit, sql_expr, table_function, udtf
+from tests.utils import TestData, Utils
 
 if not _use_sql_simplifier:
     pytest.skip(
@@ -104,6 +106,37 @@ def test_union_and_other_operators(session, set_operator):
             result2._plan.queries[-1].sql
             == f"(SELECT 1 as a) UNION ((SELECT 2 as a){set_operator}(SELECT 3 as a))"
         )
+
+
+def test_union_by_name(session):
+    df1 = session.create_dataframe([[1, 2, 11], [3, 4, 33]], schema=["a", "b", "c"])
+    df2 = session.create_dataframe([[5, 6, 55], [3, 4, 33]], schema=["a", "b", "c"])
+
+    # test flattening union_by_name works with basic example
+    df = df1.union_by_name(df2)
+    Utils.check_answer(df, [Row(1, 2, 11), Row(3, 4, 33), Row(5, 6, 55)])
+    assert df.queries["queries"][-1].count("SELECT") == 4
+
+    # test two layer select result is same as one layer select result
+    df_l1 = df.select(df.a, df.b)
+    df_l2 = df.select(df.a, df.b).select(df.a, df.b)
+    Utils.check_answer(df_l1, [Row(1, 2), Row(3, 4), Row(5, 6)])
+    assert df_l1.queries["queries"][-1].count("SELECT") == df_l2.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    # test we don't flatten in case of selecting dropped columns
+    df3 = df.select((col("a") + 1).as_("d"))
+    df4 = df3.select(df.b)
+    assert df3.queries["queries"][-1].count("SELECT") + 1 == df4.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    # test we don't flatten when it is not possible to flatten (expression eval)
+    df5 = df3.select((col("d") + 1).as_("a"))
+    assert df3.queries["queries"][-1].count("SELECT") + 1 == df5.queries["queries"][
+        -1
+    ].count("SELECT")
 
 
 def test_select_new_columns(session, simplifier_table):
@@ -251,7 +284,7 @@ def test_select_expr(session, simplifier_table):
     Utils.check_answer(df3, [Row(2, 3)])
     assert df3.queries["queries"][-1].count("SELECT") == 3
 
-    """ query has no new columns. subquery has new, chnged or dropped columns."""
+    """ query has no new columns. subquery has new, changed or dropped columns."""
     # a new column in the subquery. sql text column doesn't know the dependency, to be safe, no flatten
     df4 = df.select("a", "b", (col("a") + col("b")).as_("c"))
     df5 = df4.select_expr("a + 1 as a", "b + 1 as b", "c + 1 as c")
@@ -275,7 +308,7 @@ def test_select_expr(session, simplifier_table):
     Utils.check_answer(df11, [Row(2)])
     assert df11.queries["queries"][-1].count("SELECT") == 2
 
-    """ query has new columns. subquery has new, chnged or dropped columns."""
+    """ query has new columns. subquery has new, changed or dropped columns."""
     # a new column in the subquery. sql text column doesn't know the dependency, to be safe, no flatten
     df4 = df.select("a", "b", (col("a") + col("b")).as_("c"))
     df5 = df4.select_expr("a + b as d")
@@ -300,6 +333,150 @@ def test_select_expr(session, simplifier_table):
     assert df11.queries["queries"][-1].count("SELECT") == 2
 
 
+def test_select_with_table_function_join(session):
+    # setup
+    df = session.create_dataframe(
+        [[1, 2, "one o two"], [2, 3, "two o three"]], schema=["a", "b", "c"]
+    )
+    split_to_table = table_function("split_to_table")
+
+    @udtf(output_schema=["two_x", "three_x"])
+    class multiplier_udtf:
+        def process(self, n: int) -> Iterable[Tuple[int, int]]:
+            yield (2 * n, 3 * n)
+
+    df1 = df.select("a", split_to_table("c", lit(" ")))
+    df2 = df.select("a", multiplier_udtf(df.b))
+    # test multiple selects are flattened
+    expected = [Row(1), Row(1), Row(1), Row(2), Row(2), Row(2)]
+    df3 = df1.select("a", "seq").select("a").select("a")
+    Utils.check_answer(expected, df3)
+    assert df1.queries["queries"][-1].count("SELECT") == df3.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    expected = [Row(1), Row(2)]
+    df4 = df2.select("a", "two_x").select("a").select("a")
+    Utils.check_answer(expected, df4)
+    assert df2.queries["queries"][-1].count("SELECT") == df4.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    # test aliasing does not add extra layers
+    df5 = df.select("a", split_to_table("c", lit(" ")).as_("seq", "idx", "val"))
+    assert df1.queries["queries"][-1].count("SELECT") == df5.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    df6 = df.select("a", multiplier_udtf("b").as_("x2", "x3"))
+    assert df2.queries["queries"][-1].count("SELECT") == df6.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    # test dropped columns are not flattened
+    df7 = df1.select("a", "b")
+    assert (
+        df7.queries["queries"][-1].count("SELECT")
+        == df1.queries["queries"][-1].count("SELECT") + 1
+    )
+
+    df8 = df2.select("a", "c")
+    assert (
+        df8.queries["queries"][-1].count("SELECT")
+        == df2.queries["queries"][-1].count("SELECT") + 1
+    )
+
+    # test expressions are not flattened
+    expected = [Row(3), Row(3), Row(3), Row(4), Row(4), Row(4)]
+    df9 = df1.select((col("a") + 1).as_("a")).select((col("a") + 1).as_("a"))
+    Utils.check_answer(expected, df9)
+    assert (
+        df9.queries["queries"][-1].count("SELECT")
+        == df1.queries["queries"][-1].count("SELECT") + 1
+    )
+
+    expected = [Row(3), Row(4)]
+    df10 = df2.select((col("a") + 1).as_("a")).select((col("a") + 1).as_("a"))
+    Utils.check_answer(expected, df10)
+    assert (
+        df10.queries["queries"][-1].count("SELECT")
+        == df2.queries["queries"][-1].count("SELECT") + 1
+    )
+
+
+def test_join_table_function(session):
+    # setup
+    df = session.create_dataframe(
+        [[1, 2, "one o two"], [2, 3, "two o three"]], schema=["a", "b", "c"]
+    )
+    split_to_table = table_function("split_to_table")
+
+    @udtf(output_schema=["two_x", "three_x"])
+    class multiplier_udtf:
+        def process(self, n: int) -> Iterable[Tuple[int, int]]:
+            yield (2 * n, 3 * n)
+
+    df1 = df.join_table_function(split_to_table("c", lit(" ")))
+    df2 = df.join_table_function(multiplier_udtf("b"))
+
+    # test column flattens
+    expected = [Row(1), Row(1), Row(1), Row(2), Row(2), Row(2)]
+    df3 = df1.select("a", "b", "seq")
+    df4 = df3.select("a", "seq").select("a").select("a")
+    Utils.check_answer(expected, df4)
+    assert df3.queries["queries"][-1].count("SELECT") == df4.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    expected = [Row(1), Row(2)]
+    df5 = df2.select("a", "b", "two_x")
+    df6 = df5.select("a", "two_x").select("a").select("a")
+    Utils.check_answer(expected, df6)
+    assert df5.queries["queries"][-1].count("SELECT") == df6.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    # test column renames flatten for built-in fns
+    expected = [Row(2), Row(2), Row(2), Row(3), Row(3), Row(3)]
+    df7 = df1.select("a", "seq")
+    df8 = df7.select((col("a") + 1).as_("a"), "seq").select("a").select("a")
+    Utils.check_answer(expected, df8)
+    assert df7.queries["queries"][-1].count("SELECT") == df8.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    # test column rename flatten for user defined fns
+    expected = [Row(2), Row(3)]
+    df9 = df2.select("a", "two_x")
+    df10 = df9.select((col("a") + 1).as_("a"), "two_x").select("a").select("a")
+    Utils.check_answer(expected, df10)
+    assert df9.queries["queries"][-1].count("SELECT") == df10.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    # test flattening works for aliases fns also
+    df11 = df.join_table_function(
+        split_to_table("c", lit(" ")).as_("seq", "val", "idx")
+    )
+    df12 = df.join_table_function(multiplier_udtf("b").as_("x2", "x3"))
+
+    expected = [Row(1), Row(1), Row(1), Row(2), Row(2), Row(2)]
+    df13 = df11.select("a", "b", "idx")
+    df14 = df13.select("a", "idx").select("a").select("a")
+    Utils.check_answer(expected, df14)
+    assert df13.queries["queries"][-1].count("SELECT") == df14.queries["queries"][
+        -1
+    ].count("SELECT")
+
+    expected = [Row(1), Row(2)]
+    df15 = df12.select("a", "b", "x2")
+    df16 = df15.select("a", "x2").select("a").select("a")
+    Utils.check_answer(expected, df16)
+    assert df15.queries["queries"][-1].count("SELECT") == df16.queries["queries"][
+        -1
+    ].count("SELECT")
+
+
 def test_with_column(session, simplifier_table):
     df = session.table(simplifier_table)
     new_df = df
@@ -307,6 +484,25 @@ def test_with_column(session, simplifier_table):
         new_df = new_df.with_column(f"c{i}", lit(i))
 
     assert new_df._plan.queries[-1].sql.count("SELECT") == 1
+
+
+def test_table_function(session):
+    split_to_table = table_function("split_to_table")
+    df = session.table_function(split_to_table(lit("one two three four"), lit(" ")))
+
+    # flatten when possible
+    df1 = (
+        df.select("seq", "index").select("index").select((col("index") - 1).as_("IDX"))
+    )
+    Utils.check_answer(df1, [Row(0), Row(1), Row(2), Row(3)])
+    assert df1.queries["queries"][-1].count("SELECT") == 2
+
+    # cases when flatten is not possible
+    df2 = df.select((col("seq") + 1).as_("a"), (col("index") - 1).as_("b")).select(
+        col("a") + 1, col("b") + 7
+    )
+    Utils.check_answer(df2, [Row(3, 7), Row(3, 8), Row(3, 9), Row(3, 10)])
+    assert df2.queries["queries"][-1].count("SELECT") == 3
 
 
 def test_drop_columns(session, simplifier_table):
@@ -501,3 +697,45 @@ def test_use_sql_simplifier(session, simplifier_table):
         Utils.check_answer(df3, df4, sort=True)
     finally:
         context._use_sql_simplifier = True
+
+
+def test_sample(session, simplifier_table):
+    df = session.table(simplifier_table)
+    df_table_sample = df.sample(
+        0.5, sampling_method="BERNOULLI", seed=1
+    )  # SQL is generated from Table's sample method.
+    df1 = df_table_sample.select("a").select("a").select("a")
+    assert df1.queries["queries"][-1].count("SELECT") == 2
+    df2 = (
+        df_table_sample.select((col("a") + 1).as_("a"))
+        .select((col("a") + 1).as_("a"))
+        .select((col("a") + 1).as_("a"))
+    )
+    assert df2.queries["queries"][-1].count("SELECT") == 4
+
+    df_query_sample = df.sample(
+        0.5
+    )  # SQL is generated from DataFrame's sample method..
+    df3 = df_query_sample.select("a").select("a").select("a")
+    assert df3.queries["queries"][-1].count("SELECT") == 3
+
+    df4 = (
+        df_query_sample.select((col("a") + 1).as_("a"))
+        .select((col("a") + 1).as_("a"))
+        .select((col("a") + 1).as_("a"))
+    )
+    assert df4.queries["queries"][-1].count("SELECT") == 5
+
+
+def test_unpivot(session, simplifier_table):
+    column_list = ["jan", "feb", "mar", "apr"]
+    df = TestData.monthly_sales_flat(session).unpivot("sales", "month", column_list)
+    df1 = df.select("sales").select("sales").select("sales")
+    assert df1.queries["queries"][-1].count("SELECT") == 4
+
+    df2 = (
+        df.select((col("sales") + 1).as_("sales"))
+        .select((col("sales") + 1).as_("sales"))
+        .select((col("sales") + 1).as_("sales"))
+    )
+    assert df2.queries["queries"][-1].count("SELECT") == 6
